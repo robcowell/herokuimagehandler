@@ -1,0 +1,195 @@
+//
+// S3UploadViaAppLinkBatch.cls
+// Replaces direct AWS integration with Heroku AppLink → /sign-upload
+// - Input: List<ContentVersion Id>
+// - For each ContentVersion, requests a presigned POST (url + fields) from AppLink
+// - Performs a multipart/form-data POST to S3 (server-side) with the file bytes
+//
+// Notes:
+// * Expects an AppLink-published action named ImageService__sign_upload
+//   whose request is { key: string } and response is { url: string, fields: Map<String,String> }.
+// * If you prefer browser-direct uploads, call the same action from LWC/Flow and post from JS.
+//   This class shows the server-side path for background migrations.
+//
+
+public with sharing class S3UploadViaAppLinkBatch
+    implements Database.Batchable<SObject>, Database.AllowsCallouts
+{
+    @TestVisible static Boolean makeCallout = true;
+
+    private final List<Id> versionIds;
+
+    // Optional: prefix all S3 keys
+    private final String keyPrefix;
+
+    public S3UploadViaAppLinkBatch(List<Id> contentVersionIds, String keyPrefixOpt) {
+        if (contentVersionIds == null || contentVersionIds.isEmpty()) {
+            throw new AuraHandledException('No ContentVersion Ids provided.');
+        }
+        this.versionIds = contentVersionIds.deepClone(true);
+        this.keyPrefix  = keyPrefixOpt == null ? 'salesforce-uploads/' : keyPrefixOpt;
+    }
+
+    public Database.QueryLocator start(Database.BatchableContext bc) {
+        // Keep it light; grab only what we need for POST
+        return Database.getQueryLocator([
+            SELECT Id, ContentDocumentId, Title, FileExtension, PathOnClient,
+                   VersionData, ContentType, ContentSize
+            FROM ContentVersion
+            WHERE Id IN :versionIds
+        ]);
+    }
+
+    public void execute(Database.BatchableContext bc, List<ContentVersion> scope) {
+        List<HttpResponse> results = new List<HttpResponse>();
+        for (ContentVersion v : scope) {
+            try {
+                // 1) Build a deterministic S3 key
+                //    e.g. salesforce-uploads/<docId>/<versionId>/<slug>.<ext>
+                String fileName = coalesceFileName(v);
+                String key = keyPrefix
+                           + v.ContentDocumentId + '/'
+                           + v.Id + '/'
+                           + fileName;
+
+                // 2) Ask AppLink for a presigned POST (Heroku → S3)
+                //    AppLink exposes /sign-upload as an invocable External Service action.
+                //    Example schema: POST /sign-upload { key } -> { url, fields }
+                Map<String,Object> req = new Map<String,Object>{ 'key' => key };
+                // If your spec supports size/type guards, you can add them here:
+                // req.put('contentType', v.ContentType); req.put('maxBytes', v.ContentSize);
+
+                // IMPORTANT: The exact class/method name is created by AppLink from your OpenAPI.
+                // Replace ImageService__sign_upload with your generated name if it differs.
+                Map<String,Object> signOut = ImageService__sign_upload.invoke(req);
+
+                String postUrl               = (String) signOut.get('url');
+                Map<String,Object> fieldsAny = (Map<String,Object>) signOut.get('fields');
+                Map<String,String> fields    = castToStringMap(fieldsAny);
+
+                // 3) Construct a multipart/form-data body with fields + file part
+                MultipartForm form = new MultipartForm()
+                    .addFields(fields)
+                    // AWS S3 requires the "file" part's name to be 'file' for browser POSTs.
+                    // For server-side POSTs this is also accepted.
+                    .addFile('file', fileName, v.ContentType, v.VersionData);
+
+                // 4) POST to S3
+                HttpRequest reqPost = new HttpRequest();
+                reqPost.setMethod('POST');
+                reqPost.setEndpoint(postUrl);
+                reqPost.setHeader('Content-Type', form.getContentTypeHeader());
+                reqPost.setHeader('Accept', '*/*');
+                reqPost.setBodyAsBlob(form.render());
+
+                if (!Test.isRunningTest() || makeCallout) {
+                    Http h = new Http();
+                    HttpResponse res = h.send(reqPost);
+                    results.add(res);
+
+                    if (res.getStatusCode() >= 200 && res.getStatusCode() < 300) {
+                        System.debug(LoggingLevel.INFO,
+                            'Uploaded ' + v.Id + ' to S3 key ' + key + ' (' + res.getStatus() + ')');
+                    } else {
+                        System.debug(LoggingLevel.ERROR,
+                            'Upload failed for ' + v.Id + ': ' + res.getStatus() + ' ' + res.getBody());
+                    }
+                }
+            } catch (Exception e) {
+                System.debug(LoggingLevel.ERROR, 'Error uploading ' + v.Id + ': ' + e.getMessage());
+                System.debug(LoggingLevel.ERROR, e.getStackTraceString());
+            }
+        }
+        // (optional) persist a result object per item if you need downstream processing
+    }
+
+    public void finish(Database.BatchableContext bc) {
+        // no-op; add logging or platform events if desired
+    }
+
+    // ---------- Helpers ----------
+
+    private static String coalesceFileName(ContentVersion v) {
+        // Prefer original client path file name; fall back to Title + extension
+        String base = (v.PathOnClient == null) ? null : v.PathOnClient.substringAfterLast('/');
+        if (String.isBlank(base)) base = v.Title;
+        String ext = v.FileExtension;
+        if (!String.isBlank(ext)) {
+            // normalize ext (no dot)
+            ext = ext.startsWith('.') ? ext.substring(1) : ext;
+            if (!base.toLowerCase().endsWith('.' + ext.toLowerCase())) {
+                base = base + '.' + ext.toLowerCase();
+            }
+        }
+        return sanitizeForS3(base);
+    }
+
+    private static String sanitizeForS3(String s) {
+        // Keep it S3/URL safe; replace spaces and strip control chars
+        if (s == null) return 'file';
+        String out = s.replaceAll('[\\r\\n\\t]+',' ').trim();
+        out = out.replaceAll('\\s+', '_');
+        // remove characters that commonly cause issues in keys
+        out = out.replaceAll('[^A-Za-z0-9._\\-]+', '-');
+        if (String.isBlank(out)) out = 'file';
+        return out;
+    }
+
+    private static Map<String,String> castToStringMap(Map<String,Object> anyMap) {
+        Map<String,String> m = new Map<String,String>();
+        if (anyMap == null) return m;
+        for (String k : anyMap.keySet()) {
+            Object v = anyMap.get(k);
+            m.put(k, v == null ? null : String.valueOf(v));
+        }
+        return m;
+    }
+
+    // ----------------- Multipart builder -----------------
+    public class MultipartForm {
+        private final String boundary;
+        private final List<Blob> parts = new List<Blob>();
+
+        public MultipartForm() {
+            this.boundary = '----SFBOUNDARY' + String.valueOf(Crypto.getRandomInteger());
+        }
+        public MultipartForm addFields(Map<String,String> fields) {
+            if (fields != null) {
+                for (String k : fields.keySet()) {
+                    addField(k, fields.get(k));
+                }
+            }
+            return this;
+        }
+        public MultipartForm addField(String name, String value) {
+            String part =
+                '--' + boundary + '\r\n' +
+                'Content-Disposition: form-data; name="' + name + '"\r\n\r\n' +
+                (value == null ? '' : value) + '\r\n';
+            parts.add(Blob.valueOf(part));
+            return this;
+        }
+        public MultipartForm addFile(String name, String fileName, String contentType, Blob body) {
+            if (String.isBlank(contentType)) contentType = 'application/octet-stream';
+            String header =
+                '--' + boundary + '\r\n' +
+                'Content-Disposition: form-data; name="' + name + '"; filename="' + fileName + '"\r\n' +
+                'Content-Type: ' + contentType + '\r\n\r\n';
+            parts.add(Blob.valueOf(header));
+            parts.add(body);
+            parts.add(Blob.valueOf('\r\n'));
+            return this;
+        }
+        public Blob render() {
+            String closing = '--' + boundary + '--\r\n';
+            // stitch all blobs together
+            Blob acc = Blob.valueOf('');
+            for (Blob b : parts) acc = Blob.concat(acc, b);
+            acc = Blob.concat(acc, Blob.valueOf(closing));
+            return acc;
+        }
+        public String getContentTypeHeader() {
+            return 'multipart/form-data; boundary=' + boundary;
+        }
+    }
+}
