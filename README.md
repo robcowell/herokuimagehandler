@@ -1,12 +1,13 @@
-Dynamic Image Service – Heroku + Salesforce AppLink
+# **Dynamic Image Service – Heroku + Salesforce AppLink**
 
-This project reimplements the AWS Dynamic Image Transformation for CloudFront architecture
- entirely on Heroku, while retaining Amazon S3 for storage.
+This project reimplements the [AWS Dynamic Image Transformation for CloudFront architecture](https://aws.amazon.com/solutions/implementations/dynamic-image-transformation-for-amazon-cloudfront/) entirely on **Heroku**, while retaining **Amazon S3** for storage.  
 
-It provides on-demand, cached image transformation and tight integration with Salesforce via Heroku AppLink
-.
+It provides on-demand, cached image transformation and **tight integration with Salesforce** via [Heroku AppLink](https://devcenter.heroku.com/articles/salesforce-applink).
 
-Architecture
+---
+
+## **Architecture**
+
 Salesforce (Apex / Flow / Agentforce)
     ↕ (via AppLink, user-context aware)
 Heroku (dynos)
@@ -14,51 +15,49 @@ Heroku (dynos)
     ↔  Redis (optional hot-cache)
     ↔  Expedited CDN (global edge cache)
 
+- **Transformations**: Resize, format conversion, quality adjustments, smart crop (via [`sharp`](https://sharp.pixelplumbing.com/)).  
+- **Caching**: Strong CDN caching; optional Redis hot-cache or write-back derivatives to S3.  
+- **Security**: HMAC signatures on URLs; secrets in Heroku Config Vars.  
+- **Integration**: Published APIs auto-generate Flow and Apex actions through **Heroku AppLink**.
 
-Transformations: Resize, format conversion, quality adjustments, smart crop (via sharp
-).
+---
 
-Caching: Strong CDN caching; optional Redis hot-cache or write-back derivatives to S3.
+## **Features**
 
-Security: HMAC signatures on URLs; secrets in Heroku Config Vars.
+- 🔒 **Signed URLs** for security  
+- ⚡ **CDN edge caching** for global performance  
+- 📦 **Direct S3 uploads** from Salesforce  
+- 🔗 **One-click AppLink integration** into Salesforce  
+- 📊 **Heroku metrics and logs** + optional APM add-ons  
+- 🔄 **Extensible**: support for smart-cropping, watermarking, and other transformations  
 
-Integration: Published APIs auto-generate Flow and Apex actions through Heroku AppLink.
+---
 
-Features
+## **Requirements**
 
-🔒 Signed URLs for security
+- **Heroku CLI** and access to a team or personal Heroku account  
+- **Salesforce org** with External Services enabled  
+- Node.js 18+ (for local development)  
+- S3 bucket and credentials (with read and optional write permissions)  
 
-⚡ CDN edge caching for global performance
+---
 
-📦 Direct S3 uploads from Salesforce
+## **Quick Start**
 
-🔗 One-click AppLink integration into Salesforce
-
-📊 Heroku metrics and logs + optional APM add-ons
-
-🔄 Extensible: support for smart-cropping, watermarking, and other transformations
-
-Requirements
-
-Heroku CLI and access to a team or personal Heroku account
-
-Salesforce org with External Services enabled
-
-Node.js 18+ (for local development)
-
-S3 bucket and credentials (with read and optional write permissions)
-
-Quick Start
-1️⃣ Clone & set up
+### 1️⃣ Clone & set up
+```bash
 git clone https://github.com/your-org/dynamic-image-service.git
 cd dynamic-image-service
 heroku create img-service
 
-2️⃣ Add buildpacks & dependencies
+
+### 2️⃣ Add buildpacks & dependencies
+```bash
 heroku buildpacks:add heroku/nodejs
 npm install
 
-3️⃣ Configure environment
+### 3️⃣ Configure environment
+```bash
 heroku config:set \
   S3_BUCKET=my-image-bucket \
   S3_REGION=us-east-1 \
@@ -67,13 +66,15 @@ heroku config:set \
   IMG_SIGNING_SECRET=$(openssl rand -hex 32)
 
 4️⃣ Optional add-ons
+```bash
 # Edge caching
 heroku addons:create expedited-cdn -a img-service
 
 # Hot metadata cache
 heroku addons:create heroku-redis -a img-service
 
-Local Development
+### Local Development
+```bash
 npm install
 npm run dev
 # Open http://localhost:5000/health
